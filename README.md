@@ -4,13 +4,13 @@ Let your Claude Code instances find each other and talk. When you're running 5 s
 
 ```
   Terminal 1 (poker-engine)          Terminal 2 (eel)
-  ┌─────────────────────┐           ┌─────────────────────┐
-  │ Claude A             │           │ Claude B             │
-  │ "send a message to   │  ──────> │                      │
+  ┌───────────────────────┐          ┌──────────────────────┐
+  │ Claude A              │          │ Claude B             │
+  │ "send a message to    │  ──────> │                      │
   │  peer xyz: what files │          │ <channel> arrives    │
-  │  are you editing?"   │  <────── │  instantly, Claude B  │
-  │                      │          │  responds             │
-  └─────────────────────┘           └─────────────────────┘
+  │  are you editing?"    │  <────── │  instantly, Claude B │
+  │                       │          │  responds            │
+  └───────────────────────┘          └──────────────────────┘
 ```
 
 ## Quick start
@@ -42,8 +42,9 @@ claude --dangerously-skip-permissions --dangerously-load-development-channels se
 That's it. The broker daemon starts automatically the first time.
 
 > **Tip:** Add it to an alias so you don't have to type it every time:
+>
 > ```bash
-> alias claudeyolo='claude --dangerously-skip-permissions --dangerously-load-development-channels server:claude-peers'
+> alias claudepeers='claude --dangerously-load-development-channels server:claude-peers'
 > ```
 
 ### 4. Open a second session and try it
@@ -60,12 +61,12 @@ The other Claude receives it immediately and responds.
 
 ## What Claude can do
 
-| Tool | What it does |
-|------|-------------|
-| `list_peers` | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` |
-| `send_message` | Send a message to another instance by ID (arrives instantly via channel push) |
-| `set_summary` | Describe what you're working on (visible to other peers) |
-| `check_messages` | Manually check for messages (fallback if not using channel mode) |
+| Tool             | What it does                                                                   |
+| ---------------- | ------------------------------------------------------------------------------ |
+| `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` |
+| `send_message`   | Send a message to another instance by ID (arrives instantly via channel push)  |
+| `set_summary`    | Describe what you're working on (visible to other peers)                       |
+| `check_messages` | Manually check for messages (fallback if not using channel mode)               |
 
 ## How it works
 
@@ -106,18 +107,14 @@ bun cli.ts kill-broker       # stop the broker
 
 ## Configuration
 
-| Environment variable | Default | Description |
-|---------------------|---------|-------------|
-| `CLAUDE_PEERS_PORT` | `7899` | Broker port |
-| `CLAUDE_PEERS_DB` | `~/.claude-peers.db` | SQLite database path |
-| `OPENAI_API_KEY` | — | Enables auto-summary via gpt-5.4-nano |
+| Environment variable | Default              | Description                           |
+| -------------------- | -------------------- | ------------------------------------- |
+| `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
+| `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
+| `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
 
 ## Requirements
 
 - [Bun](https://bun.sh)
 - Claude Code v2.1.80+
 - claude.ai login (channels require it — API key auth won't work)
-
-## Without channel mode
-
-If you can't use `--dangerously-load-development-channels` (e.g. your org restricts it), the MCP server still works as a regular MCP server. The tools all function — the only difference is messages don't push automatically. Claude would need to call `check_messages` to pick them up.
