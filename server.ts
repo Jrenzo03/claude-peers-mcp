@@ -40,6 +40,10 @@ const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 
+// Max age: self-terminate after this long regardless (safety net)
+const MAX_AGE_MS = parseInt(process.env.CLAUDE_PEERS_MAX_AGE ?? "28800000", 10); // 8 hours
+const STARTED_AT = Date.now();
+
 // --- Broker communication ---
 
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
@@ -155,7 +159,7 @@ IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPO
 Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
 
 Available tools:
-- list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
+- list_peers: Discover other Claude Code instances. Defaults to machine scope (all peers on this computer). Use this to find peers in any repo, worktree, or branch.
 - send_message: Send a message to another instance by ID
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - check_messages: Manually check for new messages
@@ -170,18 +174,18 @@ const TOOLS = [
   {
     name: "list_peers",
     description:
-      "List other Claude Code instances running on this machine. Returns their ID, working directory, git repo, and summary.",
+      "List other Claude Code instances running on this machine. Returns their ID, working directory, git repo, and summary. Defaults to machine scope (all peers) — use this to find peers in any repo, worktree, or branch.",
     inputSchema: {
       type: "object" as const,
       properties: {
         scope: {
           type: "string" as const,
           enum: ["machine", "directory", "repo"],
+          default: "machine",
           description:
-            'Scope of peer discovery. "machine" = all instances on this computer. "directory" = same working directory. "repo" = same git repository (including worktrees or subdirectories).',
+            'Scope of peer discovery. "machine" (default) = all instances on this computer. "directory" = same working directory. "repo" = same git repository (including worktrees or subdirectories). Prefer "machine" to ensure no peers are missed.',
         },
       },
-      required: ["scope"],
     },
   },
   {
@@ -231,16 +235,16 @@ const TOOLS = [
 
 // --- Tool handlers ---
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS,
-}));
+mcp.setRequestHandler(ListToolsRequestSchema, async () => {
+  return { tools: TOOLS };
+});
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
 
   switch (name) {
     case "list_peers": {
-      const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo";
+      const scope = ((args as { scope?: string }).scope ?? "machine") as "machine" | "directory" | "repo";
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           scope,
@@ -454,6 +458,23 @@ async function main() {
   // 1. Ensure broker is running
   await ensureBroker();
 
+  // Detect if this is a --print (fire-and-forget) session
+  // These register as non-discoverable to avoid ghost peers
+  let isPrint = false;
+  try {
+    const ppid = process.ppid;
+    if (ppid && ppid > 1) {
+      const proc = Bun.spawnSync(["ps", "-o", "args=", "-p", String(ppid)]);
+      const parentCmd = new TextDecoder().decode(proc.stdout).trim();
+      if (parentCmd.includes("--print")) {
+        isPrint = true;
+        log("Detected --print session (non-interactive, will register as non-discoverable)");
+      }
+    }
+  } catch {
+    // Non-critical: if detection fails, assume interactive
+  }
+
   // 2. Gather context
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
@@ -487,13 +508,15 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker
+  // 4. Register with broker (include parent_pid for orphan detection)
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
+    parent_pid: process.ppid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    is_print: isPrint,
   });
   myId = reg.id;
   log(`Registered as peer ${myId}`);
@@ -531,7 +554,11 @@ async function main() {
   }, HEARTBEAT_INTERVAL_MS);
 
   // 8. Clean up on exit
-  const cleanup = async () => {
+  let cleaningUp = false;
+  const cleanup = async (reason?: string) => {
+    if (cleaningUp) return; // Prevent double-cleanup
+    cleaningUp = true;
+    if (reason) log(`Shutting down: ${reason}`);
     clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
     if (myId) {
@@ -545,8 +572,39 @@ async function main() {
     process.exit(0);
   };
 
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
+  process.on("SIGINT", () => cleanup("SIGINT"));
+  process.on("SIGTERM", () => cleanup("SIGTERM"));
+
+  // 9. MCP transport close detection
+  mcp.onclose = () => {
+    cleanup("MCP transport closed");
+  };
+
+  // 10. Detect orphaned process — self-terminate if parent exits
+  //     When Claude Code exits without signaling children, bun becomes orphaned.
+  //     On macOS/Linux orphans get reparented to launchd/init (PID 1).
+  const initialPpid = process.ppid;
+  setInterval(() => {
+    try {
+      process.kill(initialPpid, 0);
+    } catch {
+      cleanup(`parent process (PID ${initialPpid}) exited`);
+    }
+  }, 5_000);
+
+  // 11. Detect stdin EOF — MCP transport broken means Claude Code is gone
+  process.stdin.on("end", () => cleanup("stdin EOF"));
+  process.stdin.on("close", () => cleanup("stdin closed"));
+
+  // 12. Max age safety net — self-terminate after N hours regardless
+  //     Prevents infinite accumulation even if all other checks fail.
+  const maxAgeTimer = setTimeout(() => {
+    cleanup(`max age reached (${Math.round(MAX_AGE_MS / 3600000)}h)`);
+  }, MAX_AGE_MS);
+  // Unref so this timer doesn't keep the process alive
+  if (maxAgeTimer && typeof maxAgeTimer === "object" && "unref" in maxAgeTimer) {
+    (maxAgeTimer as NodeJS.Timeout).unref();
+  }
 }
 
 main().catch((e) => {

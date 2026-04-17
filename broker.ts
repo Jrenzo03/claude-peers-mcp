@@ -36,6 +36,7 @@ db.run(`
   CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY,
     pid INTEGER NOT NULL,
+    parent_pid INTEGER,
     cwd TEXT NOT NULL,
     git_root TEXT,
     tty TEXT,
@@ -44,6 +45,20 @@ db.run(`
     last_seen TEXT NOT NULL
   )
 `);
+
+// Migration: add parent_pid column if missing (existing DBs)
+try {
+  db.run("ALTER TABLE peers ADD COLUMN parent_pid INTEGER");
+} catch {
+  // Column already exists — ignore
+}
+
+// Migration: add is_print column if missing (existing DBs)
+try {
+  db.run("ALTER TABLE peers ADD COLUMN is_print INTEGER NOT NULL DEFAULT 0");
+} catch {
+  // Column already exists — ignore
+}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -58,15 +73,49 @@ db.run(`
   )
 `);
 
-// Clean up stale peers (PIDs that no longer exist) on startup
-function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
-  for (const peer of peers) {
+// Heartbeat staleness: peers that haven't heartbeated in this window are considered dead
+const HEARTBEAT_STALE_MS = 120_000; // 2 minutes (heartbeat interval is 15s, so 8 missed = dead)
+
+/**
+ * Check if a peer is still alive using PID, parent PID, and heartbeat.
+ */
+function isPeerAlive(peer: { pid: number; parent_pid: number | null; last_seen: string }): boolean {
+  // Check 1: Is the peer's own process dead?
+  try {
+    process.kill(peer.pid, 0);
+  } catch {
+    return false;
+  }
+
+  // Check 2: Is the parent process (Claude Code) dead?
+  if (peer.parent_pid && peer.parent_pid > 1) {
     try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
+      process.kill(peer.parent_pid, 0);
     } catch {
-      // Process doesn't exist, remove it
+      return false;
+    }
+  }
+
+  // Check 3: Has the peer missed too many heartbeats?
+  const lastSeen = new Date(peer.last_seen).getTime();
+  if (Date.now() - lastSeen > HEARTBEAT_STALE_MS) {
+    return false;
+  }
+
+  return true;
+}
+
+// Clean up stale peers on startup and periodically
+function cleanStalePeers() {
+  const peers = db.query("SELECT id, pid, parent_pid, last_seen FROM peers").all() as {
+    id: string;
+    pid: number;
+    parent_pid: number | null;
+    last_seen: string;
+  }[];
+
+  for (const peer of peers) {
+    if (!isPeerAlive(peer)) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
     }
@@ -81,8 +130,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, parent_pid, cwd, git_root, tty, summary, registered_at, last_seen, is_print)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -138,6 +187,7 @@ function generateId(): string {
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
+  const isPrint = body.is_print ? 1 : 0;
 
   // Remove any existing registration for this PID (re-registration)
   const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
@@ -145,7 +195,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  insertPeer.run(id, body.pid, body.parent_pid ?? null, body.cwd, body.git_root, body.tty, body.summary, now, now, isPrint);
   return { id };
 }
 
@@ -184,24 +234,42 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive
+  // Filter out --print sessions (non-interactive, can't receive messages)
+  peers = peers.filter((p) => !p.is_print);
+
+  // Verify each peer is still alive using full liveness check
   return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
-      return true;
-    } catch {
-      // Clean up dead peer
+    const alive = isPeerAlive(p);
+    if (!alive) {
       deletePeer.run(p.id);
-      return false;
+      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [p.id]);
     }
+    return alive;
   });
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
-  // Verify target exists
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
+  // Verify target exists AND is still alive
+  const target = db.query("SELECT id, pid, parent_pid, last_seen, is_print FROM peers WHERE id = ?").get(body.to_id) as {
+    id: string;
+    pid: number;
+    parent_pid: number | null;
+    last_seen: string;
+    is_print: number;
+  } | null;
+
   if (!target) {
     return { ok: false, error: `Peer ${body.to_id} not found` };
+  }
+
+  if (target.is_print) {
+    return { ok: false, error: `Peer ${body.to_id} is a non-interactive session` };
+  }
+
+  if (!isPeerAlive(target)) {
+    deletePeer.run(target.id);
+    db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [target.id]);
+    return { ok: false, error: `Peer ${body.to_id} is no longer alive` };
   }
 
   insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());

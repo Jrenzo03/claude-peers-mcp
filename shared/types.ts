@@ -4,10 +4,12 @@ export type PeerId = string;
 export interface Peer {
   id: PeerId;
   pid: number;
+  parent_pid: number | null;
   cwd: string;
   git_root: string | null;
   tty: string | null;
   summary: string;
+  is_print: boolean;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
 }
@@ -25,10 +27,12 @@ export interface Message {
 
 export interface RegisterRequest {
   pid: number;
+  parent_pid?: number;
   cwd: string;
   git_root: string | null;
   tty: string | null;
   summary: string;
+  is_print?: boolean;
 }
 
 export interface RegisterResponse {
